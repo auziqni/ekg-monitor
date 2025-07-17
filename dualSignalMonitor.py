@@ -1,11 +1,11 @@
-# filename: monitorCtFilter.py
-# revisi: v3.0  
-# short description: Real-time continuous EKG signal monitoring with hex CSV format,
+# filename: dualSignalMonitor.py
+# revisi: v1.0  
+# short description: Real-time dual channel EKG signal monitoring with hex CSV format,
 #                   auto-save CSV recording (60s max), manual start/stop controls,
 #                   10-second sliding window display, and adaptive LMS filtering
 #                   for ESP32 + ADS1115. Features dual plot display (raw/filtered)
-#                   with real-time LMS predictor filter for noise reduction.
-# this file is for singleSignal-continuous.cpp
+#                   with separate LMS predictor filters for CH0 and CH1.
+# this file is for dualSignal-continuous.cpp
 
 import sys
 import time
@@ -19,7 +19,7 @@ from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, 
                            QHBoxLayout, QWidget, QComboBox, QPushButton, 
                            QLabel, QStatusBar, QGroupBox, QTextEdit, QSplitter,
-                           QSpinBox, QDoubleSpinBox, QCheckBox)
+                           QSpinBox, QDoubleSpinBox, QCheckBox, QGridLayout)
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject, Qt
 from PyQt5.QtGui import QFont, QTextCursor
 import pyqtgraph as pg
@@ -68,7 +68,7 @@ class LMSFilter:
         error = normalized_input - predicted_normalized
         
         # Normalized LMS update with input power normalization
-        input_power = np.dot(self.input_buffer, self.input_buffer) + 1e-6  # Add small constant to avoid division by zero
+        input_power = np.dot(self.input_buffer, self.input_buffer) + 1e-6
         normalized_step = self.step_size / input_power
         
         # Update weights using normalized LMS algorithm
@@ -85,8 +85,8 @@ class LMSFilter:
         
         return predicted
 
-class SerialWorkerContinuous(QObject):
-    """Worker thread for continuous hex CSV serial communication"""
+class DualSerialWorker(QObject):
+    """Worker thread for dual channel hex CSV serial communication"""
     data_received = pyqtSignal(list)
     info_received = pyqtSignal(dict)
     warning_received = pyqtSignal(str)
@@ -101,7 +101,7 @@ class SerialWorkerContinuous(QObject):
         self.last_timestamp = None
         self.sample_interval_us = 1163  # 1000000/860 for interpolation
         self.start_time = None
-        self.current_sample_count = 0  # Track total samples received
+        self.current_sample_count = 0
         
     def connect_serial(self, port_name, baudrate):
         """Connect to serial port"""
@@ -129,15 +129,15 @@ class SerialWorkerContinuous(QObject):
         """Start reading data from serial port"""
         self.is_running = True
         self.last_timestamp = None
-        self.current_sample_count = 0  # Reset sample counter to start from 0
+        self.current_sample_count = 0
         self.start_time = None
         threading.Thread(target=self._read_loop, daemon=True).start()
     
     def parse_info_line(self, line):
-        """Parse info line: # TS:1000000 SPS:860 EFF:98% SKIP:0 TOT:5487"""
+        """Parse info line: # TS:1000000 SPS:860 CH0:430 CH1:430 EFF:98% SKIP:0 TOT:5487"""
         info = {}
         try:
-            parts = line[1:].strip().split()  # Remove # and split
+            parts = line[1:].strip().split()
             for part in parts:
                 if ':' in part:
                     key, value = part.split(':', 1)
@@ -146,6 +146,10 @@ class SerialWorkerContinuous(QObject):
                         self.last_timestamp = info['timestamp']
                     elif key == 'SPS':
                         info['sps'] = int(value)
+                    elif key == 'CH0':
+                        info['ch0_sps'] = int(value)
+                    elif key == 'CH1':
+                        info['ch1_sps'] = int(value)
                     elif key == 'EFF':
                         info['efficiency'] = int(value.replace('%', ''))
                     elif key == 'SKIP':
@@ -156,31 +160,39 @@ class SerialWorkerContinuous(QObject):
             self.status_changed.emit(f"Info parse error: {str(e)}")
         return info
     
-    def parse_hex_csv(self, line):
-        """Parse hex CSV line: 3FF,415,42B,441,456,46A,47C,48D,49C,4AA"""
+    def parse_dual_hex_csv(self, line):
+        """Parse dual hex CSV line: [7FF,800],[801,7FE],[ABC,DEF],[123,456]"""
         try:
-            hex_values = line.strip().split(',')
-            decimal_values = [int(hex_val, 16) for hex_val in hex_values if hex_val.strip()]
-            return decimal_values
+            # Find all [xxx,yyy] patterns
+            import re
+            pattern = r'\[([0-9A-Fa-f]+),([0-9A-Fa-f]+)\]'
+            matches = re.findall(pattern, line)
+            
+            ch0_values = []
+            ch1_values = []
+            
+            for match in matches:
+                ch0_hex, ch1_hex = match
+                ch0_values.append(int(ch0_hex, 16))
+                ch1_values.append(int(ch1_hex, 16))
+            
+            return ch0_values, ch1_values
         except Exception as e:
-            self.status_changed.emit(f"CSV parse error: {str(e)}")
-            return []
+            self.status_changed.emit(f"Dual CSV parse error: {str(e)}")
+            return [], []
     
     def interpolate_timestamps(self, data_count):
         """Create interpolated timestamps for data points starting from 0"""
         timestamps = []
         for i in range(data_count):
-            # Calculate time in seconds from start (time = 0)
             time_seconds = (self.current_sample_count + i) * self.sample_interval_us / 1000000.0
             timestamps.append(time_seconds)
             
-        # Update sample count for next batch
         self.current_sample_count += data_count
-        
         return timestamps
     
     def _read_loop(self):
-        """Main reading loop for continuous format"""
+        """Main reading loop for dual channel format"""
         while self.is_running and self.serial_port and self.serial_port.is_open:
             try:
                 line = self.serial_port.readline().decode('utf-8').strip()
@@ -195,63 +207,62 @@ class SerialWorkerContinuous(QObject):
                         
                 elif line.startswith('*'):
                     # Warning message
-                    warning_msg = line[1:].strip()  # Remove * prefix
+                    warning_msg = line[1:].strip()
                     self.warning_received.emit(warning_msg)
                     
                 else:
-                    # Data line (hex CSV)
-                    decimal_values = self.parse_hex_csv(line)
-                    if decimal_values:
-                        # Create timestamps for each value
-                        timestamps = self.interpolate_timestamps(len(decimal_values))
+                    # Data line (dual hex CSV)
+                    ch0_values, ch1_values = self.parse_dual_hex_csv(line)
+                    if ch0_values and ch1_values:
+                        # Create timestamps for each value pair
+                        timestamps = self.interpolate_timestamps(len(ch0_values))
                         # Emit data with timestamps
-                        self.data_received.emit([timestamps, decimal_values])
+                        self.data_received.emit([timestamps, ch0_values, ch1_values])
                         
             except Exception as e:
-                if self.is_running:  # Only report error if still supposed to be running
+                if self.is_running:
                     self.status_changed.emit(f"Read error: {str(e)}")
                 break
 
-class EKGMonitorContinuous(QMainWindow):
-    """Main application window for continuous monitoring with LMS filtering"""
+class DualEKGMonitor(QMainWindow):
+    """Main application window for dual channel monitoring with LMS filtering"""
     
     def __init__(self):
         super().__init__()
-        self.setupLMSFilter()
+        self.setupLMSFilters()
         self.setupUI()
         self.setupSerial()
         self.setupData()
         self.setupTimer()
         self.setupRecording()
         
-    def setupLMSFilter(self):
-        """Setup LMS filter"""
-        self.lms_filter = LMSFilter(filter_order=20, step_size=0.01)
-        self.filter_enabled = True
+    def setupLMSFilters(self):
+        """Setup dual LMS filters"""
+        self.lms_filter_ch0 = LMSFilter(filter_order=20, step_size=0.01)
+        self.lms_filter_ch1 = LMSFilter(filter_order=20, step_size=0.01)
+        self.filter_enabled_ch0 = True
+        self.filter_enabled_ch1 = True
         
     def setupRecording(self):
         """Setup CSV recording functionality"""
         self.recording = False
         self.recording_start_time = None
-        self.recording_duration = 60  # 60 seconds max
+        self.recording_duration = 60
         self.recording_remaining = 0
         self.csv_file = None
         self.csv_writer = None
         
-        # Recording countdown timer
         self.recording_timer = QTimer()
         self.recording_timer.timeout.connect(self.update_recording_timer)
         
-        # Create log directory if it doesn't exist
         if not os.path.exists('log'):
             os.makedirs('log')
         
     def setupUI(self):
         """Setup user interface"""
-        self.setWindowTitle("EKG Continuous Monitor with LMS Filter v3.0")
-        self.setGeometry(100, 100, 1400, 1000)
+        self.setWindowTitle("Dual Channel EKG Monitor with LMS Filter v1.0")
+        self.setGeometry(100, 100, 1600, 1000)
         
-        # Central widget with splitter
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -297,7 +308,7 @@ class EKGMonitorContinuous(QMainWindow):
         self.record_btn = QPushButton("Start Recording")
         self.record_btn.clicked.connect(self.toggle_recording)
         self.record_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
-        self.record_btn.setEnabled(False)  # Disabled until connected
+        self.record_btn.setEnabled(False)
         control_layout.addWidget(self.record_btn)
         
         # Connection status
@@ -308,51 +319,93 @@ class EKGMonitorContinuous(QMainWindow):
         control_layout.addStretch()
         main_layout.addWidget(control_group)
         
-        # Filter Control Panel
-        filter_group = QGroupBox("LMS Filter Control")
-        filter_layout = QHBoxLayout(filter_group)
+        # Signal visibility control panel
+        visibility_group = QGroupBox("Signal Visibility")
+        visibility_layout = QHBoxLayout(visibility_group)
         
-        # Enable filter checkbox
-        self.filter_enable_cb = QCheckBox("Enable Filter")
-        self.filter_enable_cb.setChecked(True)
-        self.filter_enable_cb.stateChanged.connect(self.toggle_filter)
-        filter_layout.addWidget(self.filter_enable_cb)
+        # CH0 checkboxes
+        self.ch0_raw_cb = QCheckBox("CH0 Raw")
+        self.ch0_raw_cb.setChecked(True)
+        self.ch0_raw_cb.stateChanged.connect(self.update_signal_visibility)
+        visibility_layout.addWidget(self.ch0_raw_cb)
         
-        # Filter order control
-        filter_layout.addWidget(QLabel("Order:"))
-        self.filter_order_spin = QSpinBox()
-        self.filter_order_spin.setRange(5, 50)
-        self.filter_order_spin.setValue(20)
-        self.filter_order_spin.valueChanged.connect(self.update_filter_params)
-        filter_layout.addWidget(self.filter_order_spin)
-        order_info = QLabel("(5-50)")
-        order_info.setStyleSheet("font-size: 9px; color: gray;")
-        filter_layout.addWidget(order_info)
+        self.ch0_filtered_cb = QCheckBox("CH0 Filtered")
+        self.ch0_filtered_cb.setChecked(True)
+        self.ch0_filtered_cb.stateChanged.connect(self.update_signal_visibility)
+        visibility_layout.addWidget(self.ch0_filtered_cb)
         
-        # Step size control
-        filter_layout.addWidget(QLabel("Step Size (μ):"))
-        self.step_size_spin = QDoubleSpinBox()
-        self.step_size_spin.setRange(0.001, 0.1)
-        self.step_size_spin.setValue(0.01)
-        self.step_size_spin.setDecimals(3)
-        self.step_size_spin.setSingleStep(0.001)
-        self.step_size_spin.valueChanged.connect(self.update_filter_params)
-        filter_layout.addWidget(self.step_size_spin)
-        step_info = QLabel("(0.001-0.1)")
-        step_info.setStyleSheet("font-size: 9px; color: gray;")
-        filter_layout.addWidget(step_info)
+        # CH1 checkboxes
+        self.ch1_raw_cb = QCheckBox("CH1 Raw")
+        self.ch1_raw_cb.setChecked(True)
+        self.ch1_raw_cb.stateChanged.connect(self.update_signal_visibility)
+        visibility_layout.addWidget(self.ch1_raw_cb)
         
-        # Reset filter button
-        self.reset_filter_btn = QPushButton("Reset Filter")
-        self.reset_filter_btn.clicked.connect(self.reset_filter)
-        filter_layout.addWidget(self.reset_filter_btn)
+        self.ch1_filtered_cb = QCheckBox("CH1 Filtered")
+        self.ch1_filtered_cb.setChecked(True)
+        self.ch1_filtered_cb.stateChanged.connect(self.update_signal_visibility)
+        visibility_layout.addWidget(self.ch1_filtered_cb)
         
-        # Show/Hide filtered plot button
-        self.show_filtered_btn = QPushButton("Hide Filtered")
-        self.show_filtered_btn.clicked.connect(self.toggle_filtered_plot)
-        filter_layout.addWidget(self.show_filtered_btn)
+        visibility_layout.addStretch()
+        main_layout.addWidget(visibility_group)
         
-        filter_layout.addStretch()
+        # Dual Filter Control Panel
+        filter_group = QGroupBox("Dual LMS Filter Control")
+        filter_layout = QGridLayout(filter_group)
+        
+        # CH0 Filter controls
+        filter_layout.addWidget(QLabel("CH0 Filter:"), 0, 0)
+        self.filter_enable_ch0_cb = QCheckBox("Enable")
+        self.filter_enable_ch0_cb.setChecked(True)
+        self.filter_enable_ch0_cb.stateChanged.connect(self.toggle_filter_ch0)
+        filter_layout.addWidget(self.filter_enable_ch0_cb, 0, 1)
+        
+        filter_layout.addWidget(QLabel("Order:"), 0, 2)
+        self.filter_order_ch0_spin = QSpinBox()
+        self.filter_order_ch0_spin.setRange(5, 50)
+        self.filter_order_ch0_spin.setValue(20)
+        self.filter_order_ch0_spin.valueChanged.connect(self.update_filter_params_ch0)
+        filter_layout.addWidget(self.filter_order_ch0_spin, 0, 3)
+        
+        filter_layout.addWidget(QLabel("Step Size:"), 0, 4)
+        self.step_size_ch0_spin = QDoubleSpinBox()
+        self.step_size_ch0_spin.setRange(0.001, 0.1)
+        self.step_size_ch0_spin.setValue(0.01)
+        self.step_size_ch0_spin.setDecimals(3)
+        self.step_size_ch0_spin.setSingleStep(0.001)
+        self.step_size_ch0_spin.valueChanged.connect(self.update_filter_params_ch0)
+        filter_layout.addWidget(self.step_size_ch0_spin, 0, 5)
+        
+        self.reset_filter_ch0_btn = QPushButton("Reset CH0")
+        self.reset_filter_ch0_btn.clicked.connect(self.reset_filter_ch0)
+        filter_layout.addWidget(self.reset_filter_ch0_btn, 0, 6)
+        
+        # CH1 Filter controls
+        filter_layout.addWidget(QLabel("CH1 Filter:"), 1, 0)
+        self.filter_enable_ch1_cb = QCheckBox("Enable")
+        self.filter_enable_ch1_cb.setChecked(True)
+        self.filter_enable_ch1_cb.stateChanged.connect(self.toggle_filter_ch1)
+        filter_layout.addWidget(self.filter_enable_ch1_cb, 1, 1)
+        
+        filter_layout.addWidget(QLabel("Order:"), 1, 2)
+        self.filter_order_ch1_spin = QSpinBox()
+        self.filter_order_ch1_spin.setRange(5, 50)
+        self.filter_order_ch1_spin.setValue(20)
+        self.filter_order_ch1_spin.valueChanged.connect(self.update_filter_params_ch1)
+        filter_layout.addWidget(self.filter_order_ch1_spin, 1, 3)
+        
+        filter_layout.addWidget(QLabel("Step Size:"), 1, 4)
+        self.step_size_ch1_spin = QDoubleSpinBox()
+        self.step_size_ch1_spin.setRange(0.001, 0.1)
+        self.step_size_ch1_spin.setValue(0.01)
+        self.step_size_ch1_spin.setDecimals(3)
+        self.step_size_ch1_spin.setSingleStep(0.001)
+        self.step_size_ch1_spin.valueChanged.connect(self.update_filter_params_ch1)
+        filter_layout.addWidget(self.step_size_ch1_spin, 1, 5)
+        
+        self.reset_filter_ch1_btn = QPushButton("Reset CH1")
+        self.reset_filter_ch1_btn.clicked.connect(self.reset_filter_ch1)
+        filter_layout.addWidget(self.reset_filter_ch1_btn, 1, 6)
+        
         main_layout.addWidget(filter_group)
         
         # Performance metrics panel
@@ -360,11 +413,15 @@ class EKGMonitorContinuous(QMainWindow):
         metrics_layout = QHBoxLayout(metrics_group)
         
         self.sps_label = QLabel("SPS: --")
+        self.ch0_sps_label = QLabel("CH0: --")
+        self.ch1_sps_label = QLabel("CH1: --")
         self.efficiency_label = QLabel("Efficiency: --%")
         self.skipped_label = QLabel("Skipped: --")
         self.total_label = QLabel("Total: --")
         
         metrics_layout.addWidget(self.sps_label)
+        metrics_layout.addWidget(self.ch0_sps_label)
+        metrics_layout.addWidget(self.ch1_sps_label)
         metrics_layout.addWidget(self.efficiency_label)
         metrics_layout.addWidget(self.skipped_label)
         metrics_layout.addWidget(self.total_label)
@@ -374,9 +431,9 @@ class EKGMonitorContinuous(QMainWindow):
         
         # Splitter for plots and log
         splitter = QSplitter(Qt.Vertical)
-        self.splitter = splitter  # Store reference for show/hide functionality
+        self.splitter = splitter
         
-        # Raw signal plot widget with white background
+        # Raw signal plot widget
         self.plot_widget_raw = pg.PlotWidget()
         self.plot_widget_raw.setLabel('left', 'Amplitude', units='')
         self.plot_widget_raw.setLabel('bottom', 'Time', units='s')
@@ -384,10 +441,15 @@ class EKGMonitorContinuous(QMainWindow):
         self.plot_widget_raw.setYRange(0, 4095)
         self.plot_widget_raw.showGrid(x=True, y=True)
         self.plot_widget_raw.setBackground('white')
-        self.plot_line_raw = self.plot_widget_raw.plot(pen=pg.mkPen(color='red', width=2))
+        
+        # Create plot lines with legend
+        self.plot_line_ch0_raw = self.plot_widget_raw.plot(pen=pg.mkPen(color='blue', width=2), name='CH0 Raw')
+        self.plot_line_ch1_raw = self.plot_widget_raw.plot(pen=pg.mkPen(color='gold', width=2), name='CH1 Raw')
+        self.plot_widget_raw.addLegend()
+        
         splitter.addWidget(self.plot_widget_raw)
         
-        # Filtered signal plot widget with white background
+        # Filtered signal plot widget
         self.plot_widget_filtered = pg.PlotWidget()
         self.plot_widget_filtered.setLabel('left', 'Amplitude', units='')
         self.plot_widget_filtered.setLabel('bottom', 'Time', units='s')
@@ -395,9 +457,13 @@ class EKGMonitorContinuous(QMainWindow):
         self.plot_widget_filtered.setYRange(0, 4095)
         self.plot_widget_filtered.showGrid(x=True, y=True)
         self.plot_widget_filtered.setBackground('white')
-        self.plot_line_filtered = self.plot_widget_filtered.plot(pen=pg.mkPen(color='blue', width=2))
+        
+        # Create filtered plot lines with legend
+        self.plot_line_ch0_filtered = self.plot_widget_filtered.plot(pen=pg.mkPen(color='blue', width=2), name='CH0 Filtered')
+        self.plot_line_ch1_filtered = self.plot_widget_filtered.plot(pen=pg.mkPen(color='gold', width=2), name='CH1 Filtered')
+        self.plot_widget_filtered.addLegend()
+        
         splitter.addWidget(self.plot_widget_filtered)
-        self.filtered_plot_visible = True  # Track filtered plot visibility
         
         # Log text area
         self.log_text = QTextEdit()
@@ -405,7 +471,7 @@ class EKGMonitorContinuous(QMainWindow):
         self.log_text.setFont(QFont("Consolas", 9))
         self.log_text.setStyleSheet("background-color: #f0f0f0;")
         splitter.addWidget(self.log_text)
-        self.log_visible = True  # Track log visibility
+        self.log_visible = True
         
         # Set splitter proportions
         splitter.setSizes([300, 300, 150])
@@ -419,66 +485,74 @@ class EKGMonitorContinuous(QMainWindow):
         # Initial port refresh
         self.refresh_ports()
         
-    def toggle_filter(self, state):
-        """Toggle filter enable/disable"""
-        self.filter_enabled = state == Qt.Checked
-        if self.filter_enabled:
-            self.log_message("LMS Filter enabled")
-        else:
-            self.log_message("LMS Filter disabled")
-            
-    def update_filter_params(self):
-        """Update filter parameters"""
-        filter_order = self.filter_order_spin.value()
-        step_size = self.step_size_spin.value()
-        self.lms_filter.update_parameters(filter_order, step_size)
-        self.log_message(f"Filter params updated: Order={filter_order}, μ={step_size}")
+    def update_signal_visibility(self):
+        """Update signal visibility based on checkboxes"""
+        self.plot_line_ch0_raw.setVisible(self.ch0_raw_cb.isChecked())
+        self.plot_line_ch1_raw.setVisible(self.ch1_raw_cb.isChecked())
+        self.plot_line_ch0_filtered.setVisible(self.ch0_filtered_cb.isChecked())
+        self.plot_line_ch1_filtered.setVisible(self.ch1_filtered_cb.isChecked())
         
-    def reset_filter(self):
-        """Reset filter coefficients"""
-        self.lms_filter.reset()
-        self.log_message("LMS Filter reset")
+    def toggle_filter_ch0(self, state):
+        """Toggle CH0 filter enable/disable"""
+        self.filter_enabled_ch0 = state == Qt.Checked
+        status = "enabled" if self.filter_enabled_ch0 else "disabled"
+        self.log_message(f"CH0 LMS Filter {status}")
         
-    def toggle_filtered_plot(self):
-        """Toggle filtered plot visibility"""
-        if self.filtered_plot_visible:
-            # Hide filtered plot
-            self.plot_widget_filtered.hide()
-            self.show_filtered_btn.setText("Show Filtered")
-            self.filtered_plot_visible = False
-            # Adjust splitter to give more space to raw plot
-            if self.log_visible:
-                self.splitter.setSizes([600, 0, 150])
-            else:
-                self.splitter.setSizes([800, 0, 0])
-        else:
-            # Show filtered plot
-            self.plot_widget_filtered.show()
-            self.show_filtered_btn.setText("Hide Filtered")
-            self.filtered_plot_visible = True
-            # Restore splitter proportions
-            if self.log_visible:
-                self.splitter.setSizes([300, 300, 150])
-            else:
-                self.splitter.setSizes([400, 400, 0])
+    def toggle_filter_ch1(self, state):
+        """Toggle CH1 filter enable/disable"""
+        self.filter_enabled_ch1 = state == Qt.Checked
+        status = "enabled" if self.filter_enabled_ch1 else "disabled"
+        self.log_message(f"CH1 LMS Filter {status}")
+        
+    def update_filter_params_ch0(self):
+        """Update CH0 filter parameters"""
+        filter_order = self.filter_order_ch0_spin.value()
+        step_size = self.step_size_ch0_spin.value()
+        self.lms_filter_ch0.update_parameters(filter_order, step_size)
+        self.log_message(f"CH0 Filter params updated: Order={filter_order}, μ={step_size}")
+        
+    def update_filter_params_ch1(self):
+        """Update CH1 filter parameters"""
+        filter_order = self.filter_order_ch1_spin.value()
+        step_size = self.step_size_ch1_spin.value()
+        self.lms_filter_ch1.update_parameters(filter_order, step_size)
+        self.log_message(f"CH1 Filter params updated: Order={filter_order}, μ={step_size}")
+        
+    def reset_filter_ch0(self):
+        """Reset CH0 filter coefficients"""
+        self.lms_filter_ch0.reset()
+        self.log_message("CH0 LMS Filter reset")
+        
+    def reset_filter_ch1(self):
+        """Reset CH1 filter coefficients"""
+        self.lms_filter_ch1.reset()
+        self.log_message("CH1 LMS Filter reset")
         
     def reset_signal(self):
-        """Reset signal data and plot"""
+        """Reset signal data and plots"""
         self.time_data.clear()
-        self.signal_data_raw.clear()
-        self.signal_data_filtered.clear()
+        self.ch0_raw_data.clear()
+        self.ch0_filtered_data.clear()
+        self.ch1_raw_data.clear()
+        self.ch1_filtered_data.clear()
         self.start_time = None
-        self.plot_line_raw.setData([], [])
-        self.plot_line_filtered.setData([], [])
+        
+        self.plot_line_ch0_raw.setData([], [])
+        self.plot_line_ch1_raw.setData([], [])
+        self.plot_line_ch0_filtered.setData([], [])
+        self.plot_line_ch1_filtered.setData([], [])
+        
         self.log_text.clear()
         self.status_bar.showMessage("Signal reset")
         self.log_message("Signal data reset")
-        # Reset filter
-        self.lms_filter.reset()
+        
+        # Reset both filters
+        self.lms_filter_ch0.reset()
+        self.lms_filter_ch1.reset()
         
     def setupSerial(self):
         """Setup serial worker"""
-        self.serial_worker = SerialWorkerContinuous()
+        self.serial_worker = DualSerialWorker()
         self.serial_worker.data_received.connect(self.process_data)
         self.serial_worker.info_received.connect(self.process_info)
         self.serial_worker.warning_received.connect(self.process_warning)
@@ -490,8 +564,10 @@ class EKGMonitorContinuous(QMainWindow):
         self.window_seconds = 10
         self.max_samples = 8600  # 860 SPS * 10 seconds
         self.time_data = deque(maxlen=self.max_samples)
-        self.signal_data_raw = deque(maxlen=self.max_samples)
-        self.signal_data_filtered = deque(maxlen=self.max_samples)
+        self.ch0_raw_data = deque(maxlen=self.max_samples)
+        self.ch0_filtered_data = deque(maxlen=self.max_samples)
+        self.ch1_raw_data = deque(maxlen=self.max_samples)
+        self.ch1_filtered_data = deque(maxlen=self.max_samples)
         self.start_time = None
         self.current_performance = {}
         
@@ -499,7 +575,6 @@ class EKGMonitorContinuous(QMainWindow):
         """Setup update timer"""
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plot)
-        # Don't start timer here - start when connected
         
     def toggle_recording(self):
         """Toggle CSV recording"""
@@ -511,30 +586,25 @@ class EKGMonitorContinuous(QMainWindow):
     def start_recording(self):
         """Start CSV recording"""
         try:
-            # Create filename with current timestamp
             timestamp = time.strftime("%H-%M-%S")
-            filename = f"log/{timestamp}.csv"
+            filename = f"log/dual_{timestamp}.csv"
             
-            # Open CSV file for writing
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
             
-            # Write header with new format
-            self.csv_writer.writerow(['timestamp', 'raw', 'filtered'])
+            # Write header with dual format
+            self.csv_writer.writerow(['timestamp', 'ch0_raw', 'ch0_filtered', 'ch1_raw', 'ch1_filtered'])
             
-            # Start recording
             self.recording = True
             self.recording_start_time = time.time()
             self.recording_remaining = self.recording_duration
             
-            # Update button appearance
             self.record_btn.setText(f"{self.recording_remaining}s")
             self.record_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
             
-            # Start countdown timer
-            self.recording_timer.start(1000)  # Update every second
+            self.recording_timer.start(1000)
             
-            self.log_message(f"Recording started: {filename}")
+            self.log_message(f"Dual recording started: {filename}")
             
         except Exception as e:
             self.log_message(f"Recording start failed: {str(e)}")
@@ -545,17 +615,15 @@ class EKGMonitorContinuous(QMainWindow):
             self.recording = False
             self.recording_timer.stop()
             
-            # Close CSV file
             if self.csv_file:
                 self.csv_file.close()
                 self.csv_file = None
                 self.csv_writer = None
             
-            # Reset button appearance
             self.record_btn.setText("Start Recording")
             self.record_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
             
-            self.log_message("Recording stopped")
+            self.log_message("Dual recording stopped")
             
     def update_recording_timer(self):
         """Update recording countdown timer"""
@@ -563,19 +631,18 @@ class EKGMonitorContinuous(QMainWindow):
             self.recording_remaining -= 1
             
             if self.recording_remaining <= 0:
-                # Recording time finished
                 self.stop_recording()
-                self.log_message("Recording completed (60 seconds)")
+                self.log_message("Dual recording completed (60 seconds)")
             else:
-                # Update button with remaining time
                 self.record_btn.setText(f"{self.recording_remaining}s")
                 
-    def save_data_to_csv(self, timestamp, raw_value, filtered_value):
-        """Save data point to CSV if recording"""
+    def save_data_to_csv(self, timestamp, ch0_raw, ch0_filtered, ch1_raw, ch1_filtered):
+        """Save dual data point to CSV if recording"""
         if self.recording and self.csv_writer:
             try:
-                self.csv_writer.writerow([f"{timestamp:.6f}", raw_value, f"{filtered_value:.3f}"])
-                self.csv_file.flush()  # Ensure data is written immediately
+                self.csv_writer.writerow([f"{timestamp:.6f}", ch0_raw, f"{ch0_filtered:.3f}", 
+                                        ch1_raw, f"{ch1_filtered:.3f}"])
+                self.csv_file.flush()
             except Exception as e:
                 self.log_message(f"CSV write error: {str(e)}")
 
@@ -602,8 +669,8 @@ class EKGMonitorContinuous(QMainWindow):
                     self.status_label.setStyleSheet("color: green; font-weight: bold;")
                     
                     # Start plot update timer
-                    self.update_timer.start(50)  # Update every 50ms
-                    self.log_message("Plot timer started")
+                    self.update_timer.start(50)
+                    self.log_message("Dual channel plot timer started")
                     
                     # Reset time to 0 when connecting
                     if hasattr(self, 'serial_worker'):
@@ -627,7 +694,7 @@ class EKGMonitorContinuous(QMainWindow):
             
             # Stop plot update timer
             self.update_timer.stop()
-            self.log_message("Plot timer stopped")
+            self.log_message("Dual channel plot timer stopped")
             
             # Stop recording if active
             if self.recording:
@@ -649,20 +716,14 @@ class EKGMonitorContinuous(QMainWindow):
             self.log_btn.setText("Show Log")
             self.log_visible = False
             # Adjust splitter to give all space to plots
-            if self.filtered_plot_visible:
-                self.splitter.setSizes([400, 400, 0])
-            else:
-                self.splitter.setSizes([800, 0, 0])
+            self.splitter.setSizes([400, 400, 0])
         else:
             # Show log
             self.log_text.show()
             self.log_btn.setText("Hide Log")
             self.log_visible = True
             # Restore splitter proportions
-            if self.filtered_plot_visible:
-                self.splitter.setSizes([300, 300, 150])
-            else:
-                self.splitter.setSizes([600, 0, 150])
+            self.splitter.setSizes([300, 300, 150])
         
     def log_message(self, message):
         """Add message to log text area"""
@@ -674,36 +735,44 @@ class EKGMonitorContinuous(QMainWindow):
         self.log_text.setTextCursor(cursor)
         
     def process_data(self, data_packet):
-        """Process incoming data from serial worker"""
-        timestamps, values = data_packet
+        """Process incoming dual channel data from serial worker"""
+        timestamps, ch0_values, ch1_values = data_packet
         
         # Set start time on first data (always 0)
         if self.start_time is None:
             self.start_time = 0
-            self.log_message("Start time set to 0")
+            self.log_message("Dual channel start time set to 0")
             
-        # Process each data point
-        for timestamp, raw_value in zip(timestamps, values):
+        # Process each data point pair
+        for timestamp, ch0_raw, ch1_raw in zip(timestamps, ch0_values, ch1_values):
             # Store raw data
             self.time_data.append(timestamp)
-            self.signal_data_raw.append(raw_value)
+            self.ch0_raw_data.append(ch0_raw)
+            self.ch1_raw_data.append(ch1_raw)
             
-            # Process through LMS filter
-            if self.filter_enabled:
-                filtered_value = self.lms_filter.process_sample(raw_value)
+            # Process through LMS filters
+            if self.filter_enabled_ch0:
+                ch0_filtered = self.lms_filter_ch0.process_sample(ch0_raw)
             else:
-                filtered_value = raw_value  # Pass through if filter disabled
+                ch0_filtered = ch0_raw
                 
-            self.signal_data_filtered.append(filtered_value)
+            if self.filter_enabled_ch1:
+                ch1_filtered = self.lms_filter_ch1.process_sample(ch1_raw)
+            else:
+                ch1_filtered = ch1_raw
+                
+            self.ch0_filtered_data.append(ch0_filtered)
+            self.ch1_filtered_data.append(ch1_filtered)
             
-            # Save to CSV if recording (with new format)
-            self.save_data_to_csv(timestamp, raw_value, filtered_value)
+            # Save to CSV if recording
+            self.save_data_to_csv(timestamp, ch0_raw, ch0_filtered, ch1_raw, ch1_filtered)
             
         # Debug: Log detailed info
-        if len(values) > 0:
+        if len(ch0_values) > 0:
             first_time = timestamps[0]
             last_time = timestamps[-1]
-            self.log_message(f"Data: {len(values)} samples, Time: {first_time:.3f}s to {last_time:.3f}s, Values: {min(values)}-{max(values)}")
+            self.log_message(f"Dual Data: {len(ch0_values)} pairs, Time: {first_time:.3f}s to {last_time:.3f}s")
+            self.log_message(f"CH0: {min(ch0_values)}-{max(ch0_values)}, CH1: {min(ch1_values)}-{max(ch1_values)}")
             self.log_message(f"Buffer size: {len(self.time_data)} samples")
         
     def process_info(self, info):
@@ -712,31 +781,37 @@ class EKGMonitorContinuous(QMainWindow):
         
         # Update performance labels
         self.sps_label.setText(f"SPS: {info.get('sps', '--')}")
+        self.ch0_sps_label.setText(f"CH0: {info.get('ch0_sps', '--')}")
+        self.ch1_sps_label.setText(f"CH1: {info.get('ch1_sps', '--')}")
         self.efficiency_label.setText(f"Efficiency: {info.get('efficiency', '--')}%")
         self.skipped_label.setText(f"Skipped: {info.get('skipped', '--')}")
         self.total_label.setText(f"Total: {info.get('total', '--')}")
         
         # Log performance info
-        self.log_message(f"Performance - SPS: {info.get('sps', 0)}, Efficiency: {info.get('efficiency', 0)}%, Skipped: {info.get('skipped', 0)}")
+        self.log_message(f"Performance - SPS: {info.get('sps', 0)}, CH0: {info.get('ch0_sps', 0)}, CH1: {info.get('ch1_sps', 0)}, Efficiency: {info.get('efficiency', 0)}%")
         
     def process_warning(self, warning):
         """Process warning message from ESP32"""
         self.log_message(f"⚠️ WARNING: {warning}")
         # Also show in status bar temporarily
-        self.status_bar.showMessage(f"Warning: {warning}", 5000)  # 5 seconds
+        self.status_bar.showMessage(f"Warning: {warning}", 5000)
         
     def update_plot(self):
-        """Update plots with current data"""
+        """Update plots with current dual channel data"""
         if len(self.time_data) > 0:
             # Convert to numpy arrays for plotting
             time_array = np.array(self.time_data)
-            raw_array = np.array(self.signal_data_raw)
-            filtered_array = np.array(self.signal_data_filtered)
+            ch0_raw_array = np.array(self.ch0_raw_data)
+            ch0_filtered_array = np.array(self.ch0_filtered_data)
+            ch1_raw_array = np.array(self.ch1_raw_data)
+            ch1_filtered_array = np.array(self.ch1_filtered_data)
             
             # Debug: Log plot data info
             if len(time_array) > 0:
                 time_range = f"{time_array[0]:.3f}s to {time_array[-1]:.3f}s"
-                raw_range = f"{raw_array.min()} to {raw_array.max()}"
+                ch0_range = f"{ch0_raw_array.min()} to {ch0_raw_array.max()}"
+                ch1_range = f"{ch1_raw_array.min()} to {ch1_raw_array.max()}"
+                
                 # Only log every 20 updates to avoid spam
                 if hasattr(self, 'plot_update_count'):
                     self.plot_update_count += 1
@@ -744,13 +819,16 @@ class EKGMonitorContinuous(QMainWindow):
                     self.plot_update_count = 1
                     
                 if self.plot_update_count % 20 == 0:
-                    self.log_message(f"Plot update #{self.plot_update_count}: {len(time_array)} points, Time: {time_range}, Raw: {raw_range}")
+                    self.log_message(f"Dual Plot update #{self.plot_update_count}: {len(time_array)} points")
+                    self.log_message(f"Time: {time_range}, CH0: {ch0_range}, CH1: {ch1_range}")
             
-            # Update raw plot
-            self.plot_line_raw.setData(time_array, raw_array)
+            # Update raw plots
+            self.plot_line_ch0_raw.setData(time_array, ch0_raw_array)
+            self.plot_line_ch1_raw.setData(time_array, ch1_raw_array)
             
-            # Update filtered plot
-            self.plot_line_filtered.setData(time_array, filtered_array)
+            # Update filtered plots
+            self.plot_line_ch0_filtered.setData(time_array, ch0_filtered_array)
+            self.plot_line_ch1_filtered.setData(time_array, ch1_filtered_array)
             
             # Update x-axis range to show last 10 seconds for both plots
             if len(time_array) > 0:
@@ -763,10 +841,15 @@ class EKGMonitorContinuous(QMainWindow):
             # Update status bar
             efficiency = self.current_performance.get('efficiency', 0)
             sps = self.current_performance.get('sps', 0)
-            filter_status = "ON" if self.filter_enabled else "OFF"
+            ch0_sps = self.current_performance.get('ch0_sps', 0)
+            ch1_sps = self.current_performance.get('ch1_sps', 0)
+            ch0_filter_status = "ON" if self.filter_enabled_ch0 else "OFF"
+            ch1_filter_status = "ON" if self.filter_enabled_ch1 else "OFF"
+            
             self.status_bar.showMessage(
-                f"Samples: {len(self.signal_data_raw)} | SPS: {sps} | Efficiency: {efficiency}% | "
-                f"Filter: {filter_status} | Buffer: {len(self.signal_data_raw)}/{self.max_samples} | Last: {time_array[-1]:.2f}s"
+                f"Samples: {len(self.ch0_raw_data)} | SPS: {sps} (CH0:{ch0_sps}, CH1:{ch1_sps}) | "
+                f"Efficiency: {efficiency}% | Filter: CH0:{ch0_filter_status}, CH1:{ch1_filter_status} | "
+                f"Buffer: {len(self.ch0_raw_data)}/{self.max_samples} | Last: {time_array[-1]:.2f}s"
             )
             
     def update_status(self, message):
@@ -789,7 +872,7 @@ def main():
     app.setStyle('Fusion')
     
     # Create and show main window
-    window = EKGMonitorContinuous()
+    window = DualEKGMonitor()
     window.show()
     
     # Run application

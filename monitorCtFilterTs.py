@@ -1,11 +1,11 @@
-# filename: monitorCtFilter.py
-# revisi: v3.0  
-# short description: Real-time continuous EKG signal monitoring with hex CSV format,
+# filename: monitorCtFilter-timestamp.py
+# revisi: v3.1  
+# short description: Real-time continuous EKG signal monitoring with timestamp format,
 #                   auto-save CSV recording (60s max), manual start/stop controls,
 #                   10-second sliding window display, and adaptive LMS filtering
 #                   for ESP32 + ADS1115. Features dual plot display (raw/filtered)
 #                   with real-time LMS predictor filter for noise reduction.
-# this file is for singleSignal-continuous.cpp
+# this file is compatible with singleSignal-continuous-timestamp.cpp
 
 import sys
 import time
@@ -85,8 +85,8 @@ class LMSFilter:
         
         return predicted
 
-class SerialWorkerContinuous(QObject):
-    """Worker thread for continuous hex CSV serial communication"""
+class SerialWorkerTimestamp(QObject):
+    """Worker thread for timestamped serial communication [timestamp, hex_value]"""
     data_received = pyqtSignal(list)
     info_received = pyqtSignal(dict)
     warning_received = pyqtSignal(str)
@@ -98,10 +98,8 @@ class SerialWorkerContinuous(QObject):
         self.is_running = False
         self.port_name = ""
         self.baudrate = 250000
-        self.last_timestamp = None
-        self.sample_interval_us = 1163  # 1000000/860 for interpolation
-        self.start_time = None
-        self.current_sample_count = 0  # Track total samples received
+        self.sample_count = 0
+        self.startup_time = None
         
     def connect_serial(self, port_name, baudrate):
         """Connect to serial port"""
@@ -128,9 +126,8 @@ class SerialWorkerContinuous(QObject):
     def start_reading(self):
         """Start reading data from serial port"""
         self.is_running = True
-        self.last_timestamp = None
-        self.current_sample_count = 0  # Reset sample counter to start from 0
-        self.start_time = None
+        self.sample_count = 0
+        self.startup_time = time.time()  # Python startup time for reference
         threading.Thread(target=self._read_loop, daemon=True).start()
     
     def parse_info_line(self, line):
@@ -143,7 +140,6 @@ class SerialWorkerContinuous(QObject):
                     key, value = part.split(':', 1)
                     if key == 'TS':
                         info['timestamp'] = int(value)
-                        self.last_timestamp = info['timestamp']
                     elif key == 'SPS':
                         info['sps'] = int(value)
                     elif key == 'EFF':
@@ -156,31 +152,29 @@ class SerialWorkerContinuous(QObject):
             self.status_changed.emit(f"Info parse error: {str(e)}")
         return info
     
-    def parse_hex_csv(self, line):
-        """Parse hex CSV line: 3FF,415,42B,441,456,46A,47C,48D,49C,4AA"""
+    def parse_timestamp_data(self, line):
+        """Parse timestamp data line: [1234567,A2F]"""
         try:
-            hex_values = line.strip().split(',')
-            decimal_values = [int(hex_val, 16) for hex_val in hex_values if hex_val.strip()]
-            return decimal_values
+            # Remove brackets and split by comma
+            line = line.strip()
+            if line.startswith('[') and line.endswith(']'):
+                content = line[1:-1]  # Remove brackets
+                parts = content.split(',')
+                if len(parts) == 2:
+                    timestamp_us = int(parts[0])  # Microseconds from ESP32
+                    hex_value = parts[1].strip()
+                    decimal_value = int(hex_value, 16)
+                    
+                    # Convert ESP32 microseconds to Python seconds (relative to startup)
+                    timestamp_seconds = timestamp_us / 1000000.0
+                    
+                    return timestamp_seconds, decimal_value
         except Exception as e:
-            self.status_changed.emit(f"CSV parse error: {str(e)}")
-            return []
-    
-    def interpolate_timestamps(self, data_count):
-        """Create interpolated timestamps for data points starting from 0"""
-        timestamps = []
-        for i in range(data_count):
-            # Calculate time in seconds from start (time = 0)
-            time_seconds = (self.current_sample_count + i) * self.sample_interval_us / 1000000.0
-            timestamps.append(time_seconds)
-            
-        # Update sample count for next batch
-        self.current_sample_count += data_count
-        
-        return timestamps
+            self.status_changed.emit(f"Timestamp parse error: {str(e)}")
+        return None, None
     
     def _read_loop(self):
-        """Main reading loop for continuous format"""
+        """Main reading loop for timestamp format"""
         while self.is_running and self.serial_port and self.serial_port.is_open:
             try:
                 line = self.serial_port.readline().decode('utf-8').strip()
@@ -198,22 +192,21 @@ class SerialWorkerContinuous(QObject):
                     warning_msg = line[1:].strip()  # Remove * prefix
                     self.warning_received.emit(warning_msg)
                     
-                else:
-                    # Data line (hex CSV)
-                    decimal_values = self.parse_hex_csv(line)
-                    if decimal_values:
-                        # Create timestamps for each value
-                        timestamps = self.interpolate_timestamps(len(decimal_values))
-                        # Emit data with timestamps
-                        self.data_received.emit([timestamps, decimal_values])
+                elif line.startswith('[') and line.endswith(']'):
+                    # Timestamp data line: [timestamp, hex_value]
+                    timestamp, value = self.parse_timestamp_data(line)
+                    if timestamp is not None and value is not None:
+                        self.sample_count += 1
+                        # Emit single data point with timestamp
+                        self.data_received.emit([timestamp, value])
                         
             except Exception as e:
                 if self.is_running:  # Only report error if still supposed to be running
                     self.status_changed.emit(f"Read error: {str(e)}")
                 break
 
-class EKGMonitorContinuous(QMainWindow):
-    """Main application window for continuous monitoring with LMS filtering"""
+class EKGMonitorTimestamp(QMainWindow):
+    """Main application window for timestamped monitoring with LMS filtering"""
     
     def __init__(self):
         super().__init__()
@@ -248,7 +241,7 @@ class EKGMonitorContinuous(QMainWindow):
         
     def setupUI(self):
         """Setup user interface"""
-        self.setWindowTitle("EKG Continuous Monitor with LMS Filter v3.0")
+        self.setWindowTitle("EKG Timestamp Monitor with LMS Filter v3.1")
         self.setGeometry(100, 100, 1400, 1000)
         
         # Central widget with splitter
@@ -414,7 +407,7 @@ class EKGMonitorContinuous(QMainWindow):
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        self.status_bar.showMessage("Ready - Timestamp Mode")
         
         # Initial port refresh
         self.refresh_ports()
@@ -467,18 +460,17 @@ class EKGMonitorContinuous(QMainWindow):
         self.time_data.clear()
         self.signal_data_raw.clear()
         self.signal_data_filtered.clear()
-        self.start_time = None
         self.plot_line_raw.setData([], [])
         self.plot_line_filtered.setData([], [])
         self.log_text.clear()
-        self.status_bar.showMessage("Signal reset")
+        self.status_bar.showMessage("Signal reset - Timestamp Mode")
         self.log_message("Signal data reset")
         # Reset filter
         self.lms_filter.reset()
         
     def setupSerial(self):
         """Setup serial worker"""
-        self.serial_worker = SerialWorkerContinuous()
+        self.serial_worker = SerialWorkerTimestamp()
         self.serial_worker.data_received.connect(self.process_data)
         self.serial_worker.info_received.connect(self.process_info)
         self.serial_worker.warning_received.connect(self.process_warning)
@@ -492,7 +484,6 @@ class EKGMonitorContinuous(QMainWindow):
         self.time_data = deque(maxlen=self.max_samples)
         self.signal_data_raw = deque(maxlen=self.max_samples)
         self.signal_data_filtered = deque(maxlen=self.max_samples)
-        self.start_time = None
         self.current_performance = {}
         
     def setupTimer(self):
@@ -519,8 +510,8 @@ class EKGMonitorContinuous(QMainWindow):
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
             
-            # Write header with new format
-            self.csv_writer.writerow(['timestamp', 'raw', 'filtered'])
+            # Write header with timestamp format
+            self.csv_writer.writerow(['timestamp_seconds', 'raw_value', 'filtered_value'])
             
             # Start recording
             self.recording = True
@@ -603,12 +594,7 @@ class EKGMonitorContinuous(QMainWindow):
                     
                     # Start plot update timer
                     self.update_timer.start(50)  # Update every 50ms
-                    self.log_message("Plot timer started")
-                    
-                    # Reset time to 0 when connecting
-                    if hasattr(self, 'serial_worker'):
-                        self.serial_worker.current_sample_count = 0
-                    self.log_message("Time reset to 0 on connect")
+                    self.log_message("Plot timer started - Timestamp mode")
                     
                     # Enable recording button
                     self.record_btn.setEnabled(True)
@@ -673,39 +659,29 @@ class EKGMonitorContinuous(QMainWindow):
         cursor.movePosition(QTextCursor.End)
         self.log_text.setTextCursor(cursor)
         
-    def process_data(self, data_packet):
-        """Process incoming data from serial worker"""
-        timestamps, values = data_packet
+    def process_data(self, data_point):
+        """Process incoming single data point from serial worker"""
+        timestamp, raw_value = data_point
         
-        # Set start time on first data (always 0)
-        if self.start_time is None:
-            self.start_time = 0
-            self.log_message("Start time set to 0")
-            
-        # Process each data point
-        for timestamp, raw_value in zip(timestamps, values):
-            # Store raw data
-            self.time_data.append(timestamp)
-            self.signal_data_raw.append(raw_value)
-            
-            # Process through LMS filter
-            if self.filter_enabled:
-                filtered_value = self.lms_filter.process_sample(raw_value)
-            else:
-                filtered_value = raw_value  # Pass through if filter disabled
-                
-            self.signal_data_filtered.append(filtered_value)
-            
-            # Save to CSV if recording (with new format)
-            self.save_data_to_csv(timestamp, raw_value, filtered_value)
-            
-        # Debug: Log detailed info
-        if len(values) > 0:
-            first_time = timestamps[0]
-            last_time = timestamps[-1]
-            self.log_message(f"Data: {len(values)} samples, Time: {first_time:.3f}s to {last_time:.3f}s, Values: {min(values)}-{max(values)}")
-            self.log_message(f"Buffer size: {len(self.time_data)} samples")
+        # Store raw data
+        self.time_data.append(timestamp)
+        self.signal_data_raw.append(raw_value)
         
+        # Process through LMS filter
+        if self.filter_enabled:
+            filtered_value = self.lms_filter.process_sample(raw_value)
+        else:
+            filtered_value = raw_value  # Pass through if filter disabled
+            
+        self.signal_data_filtered.append(filtered_value)
+        
+        # Save to CSV if recording
+        self.save_data_to_csv(timestamp, raw_value, filtered_value)
+        
+        # Debug log every 100 samples to avoid spam
+        if len(self.time_data) % 100 == 0:
+            self.log_message(f"Data point: T={timestamp:.3f}s, Raw={raw_value}, Filtered={filtered_value:.1f} (Buffer: {len(self.time_data)})")
+            
     def process_info(self, info):
         """Process performance info from ESP32"""
         self.current_performance = info
@@ -733,18 +709,16 @@ class EKGMonitorContinuous(QMainWindow):
             raw_array = np.array(self.signal_data_raw)
             filtered_array = np.array(self.signal_data_filtered)
             
-            # Debug: Log plot data info
-            if len(time_array) > 0:
+            # Debug: Log plot data info every 40 updates to avoid spam
+            if hasattr(self, 'plot_update_count'):
+                self.plot_update_count += 1
+            else:
+                self.plot_update_count = 1
+                
+            if self.plot_update_count % 40 == 0:
                 time_range = f"{time_array[0]:.3f}s to {time_array[-1]:.3f}s"
                 raw_range = f"{raw_array.min()} to {raw_array.max()}"
-                # Only log every 20 updates to avoid spam
-                if hasattr(self, 'plot_update_count'):
-                    self.plot_update_count += 1
-                else:
-                    self.plot_update_count = 1
-                    
-                if self.plot_update_count % 20 == 0:
-                    self.log_message(f"Plot update #{self.plot_update_count}: {len(time_array)} points, Time: {time_range}, Raw: {raw_range}")
+                self.log_message(f"Plot update #{self.plot_update_count}: {len(time_array)} points, Time: {time_range}, Raw: {raw_range}")
             
             # Update raw plot
             self.plot_line_raw.setData(time_array, raw_array)
@@ -756,7 +730,7 @@ class EKGMonitorContinuous(QMainWindow):
             if len(time_array) > 0:
                 current_time = time_array[-1]
                 x_min = current_time - self.window_seconds
-                x_max = current_time
+                x_max = current_time + 0.5  # Add small margin
                 self.plot_widget_raw.setXRange(x_min, x_max)
                 self.plot_widget_filtered.setXRange(x_min, x_max)
                 
@@ -766,7 +740,7 @@ class EKGMonitorContinuous(QMainWindow):
             filter_status = "ON" if self.filter_enabled else "OFF"
             self.status_bar.showMessage(
                 f"Samples: {len(self.signal_data_raw)} | SPS: {sps} | Efficiency: {efficiency}% | "
-                f"Filter: {filter_status} | Buffer: {len(self.signal_data_raw)}/{self.max_samples} | Last: {time_array[-1]:.2f}s"
+                f"Filter: {filter_status} | Time: {time_array[-1]:.2f}s | Mode: Timestamp"
             )
             
     def update_status(self, message):
@@ -789,7 +763,7 @@ def main():
     app.setStyle('Fusion')
     
     # Create and show main window
-    window = EKGMonitorContinuous()
+    window = EKGMonitorTimestamp()
     window.show()
     
     # Run application
