@@ -298,6 +298,9 @@ class EKGMonitorSTM(QMainWindow):
         self.csv_file = None
         self.csv_writer = None
         self.csv_buffer: list[list[str | int | float]] = []
+        # Session-based auto-save toggle
+        self.save2csv = False
+        self._session_recording = False
 
         self.recording_timer = QTimer()
         self.recording_timer.timeout.connect(self._update_recording_timer)
@@ -349,6 +352,12 @@ class EKGMonitorSTM(QMainWindow):
         self.log_btn = QPushButton("Hide Log")
         self.log_btn.clicked.connect(self._toggle_log)
         control_layout.addWidget(self.log_btn)
+
+        # Session CSV save toggle
+        self.save2csv_cb = QCheckBox("Save CSV (per session)")
+        self.save2csv_cb.setChecked(False)
+        self.save2csv_cb.stateChanged.connect(self._toggle_save2csv)
+        control_layout.addWidget(self.save2csv_cb)
 
         self.record_btn = QPushButton("Start Recording")
         self.record_btn.clicked.connect(self._toggle_recording)
@@ -505,11 +514,17 @@ class EKGMonitorSTM(QMainWindow):
                     self.status_label.setText("Connected")
                     self.status_label.setStyleSheet("color: green; font-weight: bold;")
                     self.update_timer.start(50)
+                    # Enable manual recording unless session auto-save kicks in
                     self.record_btn.setEnabled(True)
                     self.port_combo.setEnabled(False)
                     self.baudrate_combo.setEnabled(False)
                     self.refresh_btn.setEnabled(False)
                     self.channel_combo.setEnabled(False)
+                    # Auto-start session recording if enabled
+                    if self.save2csv and not self.recording:
+                        self._start_recording(session=True)
+                        # Disable manual toggle while session recording
+                        self.record_btn.setEnabled(False)
         else:
             self.serial_worker.disconnect_serial()
             self.is_connected = False
@@ -524,6 +539,8 @@ class EKGMonitorSTM(QMainWindow):
             self.baudrate_combo.setEnabled(True)
             self.refresh_btn.setEnabled(True)
             self.channel_combo.setEnabled(True)
+            # Re-enable manual record button when disconnected
+            self.record_btn.setEnabled(False)
 
     def _toggle_log(self) -> None:
         if self.log_visible:
@@ -540,6 +557,17 @@ class EKGMonitorSTM(QMainWindow):
     def _toggle_filter(self, state: int) -> None:
         self.filter_enabled = state == Qt.Checked
         self._log_message(f"LMS Filter {'enabled' if self.filter_enabled else 'disabled'}")
+
+    def _toggle_save2csv(self, state: int) -> None:
+        self.save2csv = state == Qt.Checked
+        self._log_message(f"Session CSV save {'enabled' if self.save2csv else 'disabled'}")
+        if self.is_connected:
+            if self.save2csv and not self.recording:
+                self._start_recording(session=True)
+                self.record_btn.setEnabled(False)
+            elif (not self.save2csv) and self._session_recording and self.recording:
+                self._stop_recording()
+                self.record_btn.setEnabled(True)
 
     def _update_filter_params(self) -> None:
         order = self.filter_order_spin.value()
@@ -567,22 +595,30 @@ class EKGMonitorSTM(QMainWindow):
     # --- Recording ---
     def _toggle_recording(self) -> None:
         if not self.recording:
-            self._start_recording()
+            self._start_recording(session=False)
         else:
             self._stop_recording()
 
-    def _start_recording(self) -> None:
+    def _start_recording(self, session: bool = False) -> None:
         try:
             timestamp = time.strftime("%H-%M-%S")
-            filename = f"log/stm_{timestamp}.csv"
+            suffix = "session" if session else "manual"
+            filename = f"log/stm_{suffix}_{timestamp}.csv"
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(['timestamp_seconds', 'raw_value', 'filtered_value', 'channel'])
             self.recording = True
-            self.recording_remaining = self.recording_duration
-            self.record_btn.setText(f"{self.recording_remaining}s")
-            self.record_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
-            self.recording_timer.start(1000)
+            self._session_recording = session
+            if session:
+                # Session mode: no countdown, keep recording until disconnect or toggle off
+                self.record_btn.setText("REC (session)")
+                self.record_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
+                # Do not start timer in session mode
+            else:
+                self.recording_remaining = self.recording_duration
+                self.record_btn.setText(f"{self.recording_remaining}s")
+                self.record_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
+                self.recording_timer.start(1000)
             self._log_message(f"Recording started: {filename}")
         except Exception as e:
             self._log_message(f"Recording start failed: {str(e)}")
@@ -591,6 +627,7 @@ class EKGMonitorSTM(QMainWindow):
         if self.recording:
             self.recording = False
             self.recording_timer.stop()
+            self._session_recording = False
             # Flush any buffered rows and close file
             try:
                 if self.csv_writer and self.csv_buffer:
